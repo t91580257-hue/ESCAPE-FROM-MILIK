@@ -14,50 +14,111 @@ permissions:
 jobs:
   build:
     name: Build Android APK
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
 
     env:
-      GODOT_VERSION: 4.4.1
+      GODOT_VERSION: "4.4.1"
       ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
       ANDROID_HOME: /usr/local/lib/android/sdk
 
     steps:
+      # 1. Получаем файлы репозитория
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # 2. Устанавливаем Java
       - name: Setup Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: "17"
 
+      # 3. Подготавливаем Android SDK
       - name: Setup Android SDK
         uses: android-actions/setup-android@v4
-        with:
-          packages: 'platform-tools,platforms;android-35,build-tools;35.0.0'
 
-      - name: Accept Android licenses
-        run: yes | sdkmanager --licenses || true
-
-      - name: Find and extract game ZIP
+      # 4. Устанавливаем необходимые компоненты SDK
+      - name: Install Android SDK packages
         shell: bash
         run: |
-          set -e
-          ZIP_FILE=$(find "$GITHUB_WORKSPACE" -maxdepth 2 \
-            -type f -name "escape_from_milik_godot_project.zip" \
+          set -euo pipefail
+
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT"
+
+          mkdir -p "$ANDROID_SDK_ROOT"
+
+          SDKMANAGER=$(find "$ANDROID_SDK_ROOT/cmdline-tools" \
+            -type f -name sdkmanager | sort -V | tail -n 1)
+
+          if [ -z "$SDKMANAGER" ]; then
+            echo "ERROR: sdkmanager not found"
+            exit 1
+          fi
+
+          echo "Using: $SDKMANAGER"
+
+          yes | "$SDKMANAGER" \
+            --sdk_root="$ANDROID_SDK_ROOT" \
+            --licenses || true
+
+          "$SDKMANAGER" \
+            --sdk_root="$ANDROID_SDK_ROOT" \
+            --install \
+            "platform-tools" \
+            "platforms;android-34" \
+            "build-tools;34.0.0" \
+            "cmdline-tools;latest" \
+            "cmake;3.10.2.4988404" \
+            "ndk;23.2.8568313"
+
+          echo "Android SDK packages installed."
+
+      # 5. Проверяем Java и Android SDK
+      - name: Verify Android environment
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          java -version
+
+          test -d "$ANDROID_SDK_ROOT/platform-tools"
+          test -d "$ANDROID_SDK_ROOT/platforms/android-34"
+          test -d "$ANDROID_SDK_ROOT/build-tools/34.0.0"
+
+          echo "Android environment is ready."
+
+      # 6. Находим ZIP и распаковываем игру
+      - name: Extract game project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ZIP_FILE=$(find "$GITHUB_WORKSPACE" \
+            -maxdepth 2 \
+            -type f \
+            -iname "*.zip" \
+            ! -path "*/.git/*" \
             | head -n 1)
 
           if [ -z "$ZIP_FILE" ]; then
             echo "ERROR: Game ZIP not found!"
-            echo "Upload escape_from_milik_godot_project.zip to repository root."
+            echo "Upload the game ZIP to repository root."
             exit 1
           fi
 
-          mkdir -p "$GITHUB_WORKSPACE/extracted_project"
-          unzip -q "$ZIP_FILE" -d "$GITHUB_WORKSPACE/extracted_project"
+          echo "Found archive: $ZIP_FILE"
 
-          PROJECT_FILE=$(find "$GITHUB_WORKSPACE/extracted_project" \
-            -type f -name "project.godot" | head -n 1)
+          mkdir -p "$GITHUB_WORKSPACE/extracted_project"
+
+          unzip -q "$ZIP_FILE" \
+            -d "$GITHUB_WORKSPACE/extracted_project"
+
+          PROJECT_FILE=$(find \
+            "$GITHUB_WORKSPACE/extracted_project" \
+            -type f \
+            -name "project.godot" \
+            | head -n 1)
 
           if [ -z "$PROJECT_FILE" ]; then
             echo "ERROR: project.godot not found!"
@@ -65,14 +126,37 @@ jobs:
           fi
 
           PROJECT_DIR=$(dirname "$PROJECT_FILE")
+
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
 
-          echo "Game project found: $PROJECT_DIR"
+          echo "Project directory: $PROJECT_DIR"
 
+          if [ ! -f "$PROJECT_DIR/export_presets.cfg" ]; then
+            echo "ERROR: export_presets.cfg is missing!"
+            exit 1
+          fi
+
+      # 7. Проверяем Android preset
+      - name: Verify Android export preset
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if ! grep -q 'name="Android"' \
+            "$PROJECT_DIR/export_presets.cfg"; then
+            echo "ERROR: Android export preset not found!"
+            echo "Preset must be named exactly Android."
+            exit 1
+          fi
+
+          echo "Android preset found."
+
+      # 8. Скачиваем Godot 4.4.1
       - name: Download Godot
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
+
           mkdir -p "$RUNNER_TEMP/godot"
 
           wget -q \
@@ -83,66 +167,132 @@ jobs:
             -d "$RUNNER_TEMP/godot"
 
           GODOT_BIN=$(find "$RUNNER_TEMP/godot" \
-            -type f -name "Godot_v*-stable_linux.x86_64" | head -n 1)
+            -type f \
+            -name "Godot_v*-stable_linux.x86_64" \
+            | head -n 1)
+
+          if [ -z "$GODOT_BIN" ]; then
+            echo "ERROR: Godot executable not found!"
+            exit 1
+          fi
 
           chmod +x "$GODOT_BIN"
-          ln -sf "$GODOT_BIN" "$RUNNER_TEMP/godot/godot"
 
-          echo "$RUNNER_TEMP/godot" >> "$GITHUB_PATH"
+          echo "GODOT_BIN=$GODOT_BIN" >> "$GITHUB_ENV"
 
-      - name: Download Android export templates
+          "$GODOT_BIN" --version
+
+      # 9. Скачиваем шаблоны экспорта
+      - name: Download Godot export templates
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
 
           wget -q \
             "https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}-stable/Godot_v${GODOT_VERSION}-stable_export_templates.tpz" \
             -O "$RUNNER_TEMP/templates.tpz"
 
-          mkdir -p "$HOME/.local/share/godot/export_templates/${GODOT_VERSION}.stable"
+          mkdir -p "$RUNNER_TEMP/template_extract"
 
           unzip -q "$RUNNER_TEMP/templates.tpz" \
-            -d "$RUNNER_TEMP/godot_templates"
+            -d "$RUNNER_TEMP/template_extract"
 
-          cp -a "$RUNNER_TEMP/godot_templates/templates/." \
-            "$HOME/.local/share/godot/export_templates/${GODOT_VERSION}.stable/"
+          TEMPLATE_SOURCE="$RUNNER_TEMP/template_extract/templates"
 
-      - name: Configure Godot Android SDK
+          TEMPLATE_DEST="$HOME/.local/share/godot/export_templates/${GODOT_VERSION}.stable"
+
+          if [ ! -d "$TEMPLATE_SOURCE" ]; then
+            echo "ERROR: Template directory not found!"
+            exit 1
+          fi
+
+          mkdir -p "$TEMPLATE_DEST"
+
+          cp -a "$TEMPLATE_SOURCE/." "$TEMPLATE_DEST/"
+
+          if [ ! -f "$TEMPLATE_DEST/android_debug.apk" ]; then
+            echo "ERROR: Android debug template missing!"
+            exit 1
+          fi
+
+          echo "Godot Android templates installed."
+
+      # 10. Настраиваем Android пути в Godot
+      - name: Configure Godot Android settings
         shell: bash
         run: |
+          set -euo pipefail
+
           mkdir -p "$HOME/.config/godot"
 
           cat > "$HOME/.config/godot/editor_settings-4.tres" <<EOF
           [gd_resource type="EditorSettings" format=3]
 
           [resource]
-          export/android/android_sdk_path = "/usr/local/lib/android/sdk"
+          export/android/android_sdk_path = "$ANDROID_SDK_ROOT"
           export/android/java_sdk_path = "$JAVA_HOME"
           EOF
 
+          echo "Godot Android settings configured."
+
+      # 11. Создаём стандартный debug keystore
+      - name: Create debug keystore
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$HOME/.android"
+
+          if [ ! -f "$HOME/.android/debug.keystore" ]; then
+            keytool -genkeypair \
+              -v \
+              -keystore "$HOME/.android/debug.keystore" \
+              -storepass android \
+              -alias androiddebugkey \
+              -keypass android \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+          fi
+
+          echo "Debug keystore ready."
+
+      # 12. Импортируем проект и ресурсы
       - name: Import Godot project
         shell: bash
         run: |
-          set -e
-          godot --version
-          godot --headless --editor --path "$PROJECT_DIR" --quit
+          set -euo pipefail
 
-      - name: Build Android APK
+          "$GODOT_BIN" \
+            --headless \
+            --editor \
+            --path "$PROJECT_DIR" \
+            --import \
+            --quit
+
+          echo "Godot project import completed."
+
+      # 13. Собираем APK
+      - name: Export Android APK
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
 
           mkdir -p "$GITHUB_WORKSPACE/builds"
 
-          godot --headless \
+          "$GODOT_BIN" \
+            --headless \
             --path "$PROJECT_DIR" \
-            --export-debug "Android" \
+            --export-debug \
+            "Android" \
             "$GITHUB_WORKSPACE/builds/EscapeFromMilik.apk"
 
-      - name: Check APK
+      # 14. Проверяем готовый APK
+      - name: Verify APK
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
 
           APK="$GITHUB_WORKSPACE/builds/EscapeFromMilik.apk"
 
@@ -152,16 +302,19 @@ jobs:
           fi
 
           SIZE=$(stat -c%s "$APK")
-          SIZE_MB=$(du -m "$APK" | cut -f1)
+          SIZE_MB=$(awk "BEGIN {printf \"%.2f\", $SIZE/1048576}")
 
-          echo "APK size: ${SIZE_MB} MB"
+          echo "APK size: $SIZE_MB MiB"
 
           if [ "$SIZE" -gt 103809024 ]; then
-            echo "ERROR: APK is larger than 99 MiB!"
+            echo "ERROR: APK exceeds 99 MiB."
             exit 1
           fi
 
-      - name: Upload APK
+          echo "APK file exists and passed size check."
+
+      # 15. Загружаем APK в GitHub
+      - name: Upload Android APK
         uses: actions/upload-artifact@v4
         with:
           name: Escape-From-Milik-Android-APK
