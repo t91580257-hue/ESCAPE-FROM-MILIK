@@ -23,30 +23,26 @@ jobs:
       ANDROID_HOME: /usr/local/lib/android/sdk
 
     steps:
-      # 1. Получаем файлы репозитория
+      # 1. Получение файлов репозитория
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # 2. Устанавливаем Java
-      - name: Setup Java 17
+      # 2. Установка Java 17
+      - name: Setup Java
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
 
-      # 3. Подготавливаем Android SDK
+      # 3. Подготовка Android SDK
       - name: Setup Android SDK
         uses: android-actions/setup-android@v4
 
-      # 4. Устанавливаем необходимые компоненты SDK
+      # 4. Установка Android-компонентов
       - name: Install Android SDK packages
         shell: bash
         run: |
           set -euo pipefail
-
-          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT"
-
-          mkdir -p "$ANDROID_SDK_ROOT"
 
           SDKMANAGER=$(find "$ANDROID_SDK_ROOT/cmdline-tools" \
             -type f -name sdkmanager | sort -V | tail -n 1)
@@ -56,25 +52,35 @@ jobs:
             exit 1
           fi
 
-          echo "Using: $SDKMANAGER"
-
           yes | "$SDKMANAGER" \
             --sdk_root="$ANDROID_SDK_ROOT" \
             --licenses || true
 
           "$SDKMANAGER" \
             --sdk_root="$ANDROID_SDK_ROOT" \
-            --install \
-            "platform-tools" \
-            "platforms;android-34" \
-            "build-tools;34.0.0" \
-            "cmdline-tools;latest" \
-            "cmake;3.10.2.4988404" \
-            "ndk;23.2.8568313"
+            --install "platform-tools"
 
-          echo "Android SDK packages installed."
+          "$SDKMANAGER" \
+            --sdk_root="$ANDROID_SDK_ROOT" \
+            --install "platforms;android-34"
 
-      # 5. Проверяем Java и Android SDK
+          "$SDKMANAGER" \
+            --sdk_root="$ANDROID_SDK_ROOT" \
+            --install "build-tools;34.0.0"
+
+          "$SDKMANAGER" \
+            --sdk_root="$ANDROID_SDK_ROOT" \
+            --install "cmake;3.10.2.4988404"
+
+          "$SDKMANAGER" \
+            --sdk_root="$ANDROID_SDK_ROOT" \
+            --install "ndk;23.2.8568313"
+
+          yes | "$SDKMANAGER" \
+            --sdk_root="$ANDROID_SDK_ROOT" \
+            --licenses || true
+
+      # 5. Проверка Android SDK и Java
       - name: Verify Android environment
         shell: bash
         run: |
@@ -86,24 +92,26 @@ jobs:
           test -d "$ANDROID_SDK_ROOT/platforms/android-34"
           test -d "$ANDROID_SDK_ROOT/build-tools/34.0.0"
 
-          echo "Android environment is ready."
+          echo "Android SDK is ready."
 
-      # 6. Находим ZIP и распаковываем игру
+      # 6. Установка Python
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # 7. Проверка и распаковка ZIP
       - name: Extract game project
         shell: bash
         run: |
           set -euo pipefail
 
-          ZIP_FILE=$(find "$GITHUB_WORKSPACE" \
-            -maxdepth 2 \
-            -type f \
-            -iname "*.zip" \
-            ! -path "*/.git/*" \
-            | head -n 1)
+          ZIP_FILE="$GITHUB_WORKSPACE/escape_from_milik_optimized_20-24mb.zip"
 
-          if [ -z "$ZIP_FILE" ]; then
+          if [ ! -f "$ZIP_FILE" ]; then
             echo "ERROR: Game ZIP not found!"
-            echo "Upload the game ZIP to repository root."
+            echo "Files in repository:"
+            find "$GITHUB_WORKSPACE" -maxdepth 3 -type f
             exit 1
           fi
 
@@ -111,17 +119,57 @@ jobs:
 
           mkdir -p "$GITHUB_WORKSPACE/extracted_project"
 
-          unzip -q "$ZIP_FILE" \
-            -d "$GITHUB_WORKSPACE/extracted_project"
+          python3 - "$ZIP_FILE" "$GITHUB_WORKSPACE/extracted_project" <<'PY'
+          import sys
+          import zipfile
+          import os
 
-          PROJECT_FILE=$(find \
-            "$GITHUB_WORKSPACE/extracted_project" \
-            -type f \
-            -name "project.godot" \
-            | head -n 1)
+          archive = sys.argv[1]
+          destination = sys.argv[2]
+
+          print("Checking ZIP archive...")
+
+          with zipfile.ZipFile(archive, "r") as z:
+              print("Files:", len(z.infolist()))
+
+              methods = {}
+              for item in z.infolist():
+                  methods[item.compress_type] = (
+                      methods.get(item.compress_type, 0) + 1
+                  )
+
+              print("Compression methods:", methods)
+
+              bad = z.testzip()
+              if bad:
+                  raise RuntimeError(
+                      "Corrupted ZIP file member: " + bad
+                  )
+
+              root = os.path.realpath(destination)
+
+              for item in z.infolist():
+                  target = os.path.realpath(
+                      os.path.join(destination, item.filename)
+                  )
+
+                  if os.path.commonpath([root, target]) != root:
+                      raise RuntimeError(
+                          "Unsafe ZIP path: " + item.filename
+                      )
+
+              z.extractall(destination)
+
+          print("ZIP successfully extracted.")
+          PY
+
+          PROJECT_FILE=$(find "$GITHUB_WORKSPACE/extracted_project" \
+            -type f -name "project.godot" | head -n 1)
 
           if [ -z "$PROJECT_FILE" ]; then
             echo "ERROR: project.godot not found!"
+            find "$GITHUB_WORKSPACE/extracted_project" \
+              -maxdepth 5 -type f | head -100
             exit 1
           fi
 
@@ -132,26 +180,25 @@ jobs:
           echo "Project directory: $PROJECT_DIR"
 
           if [ ! -f "$PROJECT_DIR/export_presets.cfg" ]; then
-            echo "ERROR: export_presets.cfg is missing!"
+            echo "ERROR: export_presets.cfg not found!"
             exit 1
           fi
 
-      # 7. Проверяем Android preset
+      # 8. Проверка Android-пресета
       - name: Verify Android export preset
         shell: bash
         run: |
           set -euo pipefail
 
-          if ! grep -q 'name="Android"' \
+          if ! grep -Eq 'name="Android"' \
             "$PROJECT_DIR/export_presets.cfg"; then
             echo "ERROR: Android export preset not found!"
-            echo "Preset must be named exactly Android."
             exit 1
           fi
 
-          echo "Android preset found."
+          echo "Android export preset found."
 
-      # 8. Скачиваем Godot 4.4.1
+      # 9. Скачивание Godot
       - name: Download Godot
         shell: bash
         run: |
@@ -182,7 +229,7 @@ jobs:
 
           "$GODOT_BIN" --version
 
-      # 9. Скачиваем шаблоны экспорта
+      # 10. Загрузка шаблонов экспорта
       - name: Download Godot export templates
         shell: bash
         run: |
@@ -202,7 +249,7 @@ jobs:
           TEMPLATE_DEST="$HOME/.local/share/godot/export_templates/${GODOT_VERSION}.stable"
 
           if [ ! -d "$TEMPLATE_SOURCE" ]; then
-            echo "ERROR: Template directory not found!"
+            echo "ERROR: Export templates directory missing!"
             exit 1
           fi
 
@@ -212,12 +259,13 @@ jobs:
 
           if [ ! -f "$TEMPLATE_DEST/android_debug.apk" ]; then
             echo "ERROR: Android debug template missing!"
+            find "$TEMPLATE_DEST" -maxdepth 2 -type f
             exit 1
           fi
 
-          echo "Godot Android templates installed."
+          echo "Godot templates installed."
 
-      # 10. Настраиваем Android пути в Godot
+      # 11. Настройка Godot Android
       - name: Configure Godot Android settings
         shell: bash
         run: |
@@ -235,7 +283,7 @@ jobs:
 
           echo "Godot Android settings configured."
 
-      # 11. Создаём стандартный debug keystore
+      # 12. Создание debug keystore
       - name: Create debug keystore
         shell: bash
         run: |
@@ -258,7 +306,7 @@ jobs:
 
           echo "Debug keystore ready."
 
-      # 12. Импортируем проект и ресурсы
+      # 13. Импорт ресурсов проекта
       - name: Import Godot project
         shell: bash
         run: |
@@ -271,9 +319,9 @@ jobs:
             --import \
             --quit
 
-          echo "Godot project import completed."
+          echo "Project import completed."
 
-      # 13. Собираем APK
+      # 14. Экспорт APK
       - name: Export Android APK
         shell: bash
         run: |
@@ -288,7 +336,7 @@ jobs:
             "Android" \
             "$GITHUB_WORKSPACE/builds/EscapeFromMilik.apk"
 
-      # 14. Проверяем готовый APK
+      # 15. Проверка APK
       - name: Verify APK
         shell: bash
         run: |
@@ -307,13 +355,13 @@ jobs:
           echo "APK size: $SIZE_MB MiB"
 
           if [ "$SIZE" -gt 103809024 ]; then
-            echo "ERROR: APK exceeds 99 MiB."
+            echo "ERROR: APK exceeds 99 MiB!"
             exit 1
           fi
 
-          echo "APK file exists and passed size check."
+          echo "APK verification completed."
 
-      # 15. Загружаем APK в GitHub
+      # 16. Загрузка APK
       - name: Upload Android APK
         uses: actions/upload-artifact@v4
         with:
